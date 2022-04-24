@@ -1,0 +1,377 @@
+---
+title: "Twitter Data Tutorial"
+author: Jihyeon Bae
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+    bookdown::html_document2:
+        number_sections: true
+        theme: flatly
+        self_contained: true
+        toc: true
+        toc_float:
+            collapsed: false
+            smooth_scroll: false
+editor_options: 
+        markdown: 
+        wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, eval = TRUE)
+```
+
+# Introduction 
+This tutorial will mainly use "rtweets" and "academictwitteR" pacakges. To get an access to historical data, you need to get an approval from the Twitter API and receive a token. You will be asked to briefly explain your research project. Then, "academictwitteR" allows researchers to extract and analyze historical data. It is a new package designed to work with an academic API. 
+
+## Questions we can answer 
+- What went viral in April 2021?
+- What are the characteristics of those who follow anti-vax account? Are they likely to be Republican?
+- What are general sentiments towards covid policies?
+- Does video clips help users generate more retweets? 
+- How many tweeter users in Seattle reported to have symptoms? 
+
+
+## How to get API credentials
+Apply for twitter API account: https://developer.twitter.com/en/apply-for-access 
+You will have to apply for either a standard API or an academic API. You'll have to write a few paragraphs about your project. It took less than a week to get approved. An academic API makes it easier for you to access more data. The main difference between the standard and academic API is that the latter allows you to access historical data, those date back to the beginning of Twitter. You can only download data from the most recent 7 days with a standard API. Once your application gets approved, you will get a set of credentials. All we need is the "bearer_token". 
+
+
+## Load packages
+```{r}
+library(rtweet)
+library(tidyverse)
+library(here)
+library(lubridate)
+library(scales)
+library(leaflet)
+library(academictwitteR)
+library(ggmap)
+library(ggplot2)
+library(tidygeocoder)
+library(sf)
+library(quanteda)
+library(jtools)
+library(dplyr)
+library(dotwhisker)
+library(tidytext)
+```
+
+## Embedding your credentials
+
+First, we have to save our Twitter API credentials. Rtweet works with the standard API, but academictwitteR package requires the academic API. I will first use rtweet package for recent data, and academictwitteR for historical data. 
+```{r}
+set_bearer()  
+#this will bring you to the R environment. Once you set the token, you have to restart R studio.
+
+```
+
+
+# Getting Tweets
+## Focusing on a user
+We can extract information about a particular Twitter user. 
+```{r, error=FALSE, warning = FALSE}
+info <- lookup_users("uwnews")
+#this gives us the self reported location
+info$location
+#this pulls out the most recent 100 tweets
+tweets <- get_timeline("uwnews", n = 100)
+#let's explore more about its followers and friends
+friends <- get_friends("uwnews", n=50) #friends are people I follow
+users <- lookup_users(friends$user_id) 
+users_info <- lookup_users(users$screen_name) 
+
+followers <- get_followers ("uwnews")
+followers_info <- lookup_users(lookup_users(followers$user_id)$screen_name)
+
+
+```
+
+We can plot the frequency of recent tweets. 
+```{r}
+tweets %>% 
+  ts_plot(by = "days") + 
+  geom_point() + 
+  labs(title = "Frequency of UWnews tweets by days", x = NULL)+
+  theme_bw(base_size = 14)
+```
+
+## Focusing on a topic
+Suppose we're interested in knowing anti-vax hashtags. We can scrape the most recent 100 tweets using "search_tweets()" function. 
+```{r, message = FALSE}
+#I extracted this first batch at April 16 4:16pm.
+antivax <- search_tweets("#antivax OR #anti-vax OR #no-vaccine-mandates", 
+                           n = 100, 
+                           include_rts = FALSE) #this excludes retweet
+#since we're collecting tweets that are most recent at the time of searching, we can add updated tweets multiple times. 
+#I saved the first data so that I can append more later.
+write_rds(antivax, here("antivax.RDS"))
+
+#get the most recent tweet from precious extract and add more tweets that were posted after the previous time stamp
+antivax <- read_rds((here("antivax.RDS"))) 
+oldest_tweet <- max(antivax$status_id)
+antivax_update <- search_tweets("#antivax OR #anti-vax OR #no-vaccine-mandates",
+                                 n = 500,
+                                 include_rts = FALSE,
+                                 since_id = oldest_tweet)
+update <- bind_rows(antivax, antivax_update)
+#Plotting the number of anti-vax tweets
+update %>% 
+  ts_plot("hours") + 
+  geom_point() + 
+  labs(title = "Tweets about anti-vax by hours") + 
+  theme_bw(base_size = 14)
+```
+
+## Focusing on a place
+
+We can also restrict our searches to be based on particular location. use "geocode" to specify the coordinates. Some tweets have geotags, others have self-reported location. We are going to add coordinates for both. 
+
+```{r}
+seattle_tweets <- search_tweets(
+  geocode = "47.6062,-122.3321,10mi",  #coordinates of the latitude, longitude, radius
+  n = 1000,
+  include_rts=FALSE)
+  #q = "key word") This extracts tweets that include specific words
+
+seattle_tweets <- lat_lng(seattle_tweets) #This function appends data with latitude and longitude
+
+seattle_tweets %>% 
+  select(lat, lng) %>% 
+  filter(!is.na(lat))
+
+seattle_tweets %>%
+  summarize(sum(!is.na(lat))) #total number of tweets that have geolocations
+```
+
+# Geocoding and Mapping 
+We can map self-reported places from users. To do so, we need to download a GeoJSON map file. You can download any types of maps here(https://github.com/johan/world.geo.json/). Save a map to your working directory. 
+
+## Geocoding self reported places
+```{r geocoding, message = FALSE}
+#we can code self-reported locations
+tweet_location <- tibble(location = seattle_tweets$location)
+tweet_location <- tweet_location %>%
+  tidygeocoder::geocode(address = location,
+                         method = "osm") 
+tweet_location <- tweet_location%>%
+  mutate(lat_sr = ifelse(lat > 47, lat, NA),
+         lng_sr = ifelse(long < -122.0 & long > -122.7, long, NA))%>%
+  select(-lat, -long)
+
+
+#Then we can join these lat/longs back onto our tweets tibble, and then create a "final" latitude and longitude column which takes the location data if available, and if not, it takes the self-reported information. 
+
+seattle_tweets <- seattle_tweets %>% 
+  bind_cols(tweet_location %>% select(-location))
+
+seattle_tweets <- seattle_tweets %>% 
+  mutate(lat_final = ifelse(!is.na(lat), lat, lat_sr),
+         lng_final = ifelse(!is.na(lng), lng, lng_sr))
+
+seattle_tweets %>% 
+  summarize(sum(!is.na(lat_final)))
+
+
+```
+
+## Mapping
+In this section, we can visualize geocoded tweets. First, load in a Washington map shape file in GeoJSON format. 
+```{r Mapping}
+map <- st_read(here("data/WA.geo.json"), quiet=TRUE)
+#let's load in the map
+ggplot(data = map) +
+  geom_sf(size = 0.1)
+
+#I zoomed in the map into downtown Seattle area. You can specify a specific location interest by coord_sf() function that allows you to specify coordinate boundaries
+
+ggplot(data = map) +
+  geom_sf()+
+  coord_sf(xlim = c(-123, -121.0), ylim =c(47.4, 48))+
+  guides(fill = FALSE)+
+  geom_point(data = seattle_tweets, aes(x = lng_final, y = lat_final))
+
+#for a more interactive map, leaflet() can be useful.
+leaflet() %>% 
+  addProviderTiles(providers$Stamen.TonerLite) %>% 
+  addMarkers(lat = seattle_tweets$lat_final,
+             lng = seattle_tweets$lng_final,
+             popup = seattle_tweets$text)
+```
+
+# Text Analysis
+This section introduces some ways to analyze contents of tweets. We can count the frequency of particular words included in tweets, analyze sentiments behind viral words, and run statistical models to understand which word in particular generated most retweets.
+
+## Estimating positive cases
+```{r}
+covid <- search_tweets(
+  q = "covid",
+  geocode = "47.6062,-122.3321,50mi",  #coordinates of the latitude, longitude, radius
+  n = 1000)
+
+positive <- covid %>% 
+  filter((str_detect(text, "tested positive")|str_detect(text, "got covid")))
+
+```
+
+Now we have the number of twitter users who posted "tested positive". Given the total number of unique tweets uploaded for three days, we can estimate the percentage of people who were tested positive over the entire users in Seattle area who mentioned covid.
+
+```{r}
+n_positive <- length(unique(positive$user_id))
+n_total <- covid %>% 
+  filter(day(created_at)>14&day(created_at)<19) %>% 
+  summarize(length(unique(user_id))) %>% 
+  pull()
+n_positive/n_total*100
+```
+## Word Frequency
+Term frequency, tf-idf, gives the number of times a word is used in a particular document and teases out unique words. Inverse document frequency (idf) penalizes words that occur in many documents. 
+
+```{r}
+tidy_tweets <- positive %>% 
+  mutate(tweet = row_number()) %>% 
+  filter(is_retweet==FALSE) %>% 
+  mutate(text = str_trim(str_replace_all(text, "@[A-Za-z0-9]+\\w+", ""))) %>% 
+  # remove twitter handles
+  mutate(text = str_trim(str_replace_all(text, "#[A-Za-z0-9]+\\w+", ""))) %>% 
+  # remove hashtags
+  mutate(text = str_replace_all(text, "https://t.co/[A-Za-z0-9]+\\w+", "")) %>% 
+  # remove websites
+  mutate(text = str_replace_all(text, "\\w*[0-9]+\\w*\\s*", "")) %>% 
+  # remove numbers
+  mutate(text = str_replace_all(text, "[^\x01-\x7F]+", "")) %>%  
+  # remove non-english  characters
+  select(created_at, tweet, text) %>% 
+  unnest_tokens(word, text)
+
+word_freq <- tidy_tweets %>% 
+  mutate(day = day(created_at)) %>% 
+  count(day, word, sort = TRUE) 
+
+word_freq %>% 
+  arrange(-n ) %>% 
+  group_by(day) %>% 
+  top_n(5)
+
+tf_idf <- word_freq %>% 
+  bind_tf_idf(word, day, n) %>%
+  arrange(day, -n) %>% 
+  group_by(day) %>% 
+  top_n(5, wt = tf_idf) 
+
+tf_idf
+
+```
+## Sentiment Analysis
+We can categorize words into whether or not they are generally thought to be positive or negative, across days and tweets. "bing" option comes from the included "sentiments" data frame which is included in the "tidytext" package.
+
+```{r}
+bing <- get_sentiments("bing")
+common_words_by_sentiment <- tidy_tweets %>% 
+  inner_join(bing) %>% 
+  count(word, sentiment) %>% 
+  arrange(sentiment, -n )
+
+common_words_by_sentiment %>% 
+  group_by(sentiment) %>% 
+  top_n(5)
+```
+
+```{r}
+
+prop_negative <- tidy_tweets %>% 
+  mutate(hour = hour(created_at))%>% 
+  inner_join(bing) %>% 
+  count(word, hour, sentiment) %>% 
+  group_by(hour) %>% 
+  summarize(prop_negative_tweets = sum(n[sentiment=="negative"])/sum(n))
+
+prop_negative %>% 
+  ggplot(aes(hour, prop_negative_tweets)) + 
+  geom_line() + 
+  labs(title = "Proportion of negative words", 
+       x = "time created",
+       y = "proportion of negative words",
+       caption = "Based on 500 tweets mentioning Covid collected using rtweet") 
+
+```
+
+## What's going viral?
+
+Let's look at uwnews account. What keywords make it popular?
+```{r}
+#
+mostpopular <- tweets %>%
+  select(text, retweet_count, screen_name) %>%
+  arrange(desc(retweet_count))
+
+nGrams <- mostpopular %>%
+  unnest_tokens(word, text, token = "ngrams", n = 1)
+
+nGramSort <- nGrams %>%
+  group_by(word) %>%
+  summarize(n=n(), avg_retweets = mean(retweet_count)) %>%
+  filter(n > 10) %>%
+  arrange(desc(avg_retweets))
+
+#### Predicting Retweets ####
+
+#create list of dictionary
+MoralEmotional <- scan("data/Dictionaries/MoralEmotional.txt", 
+                       what='character', sep="\n", skipNul = TRUE)
+Polarization <- scan("data/Dictionaries/Polarization.txt", 
+                     what='character', sep="\n", skipNul = TRUE)
+dictionary = dictionary(list(MoralEmotional = MoralEmotional,
+                             Polarization = Polarization))
+
+#quanteda steps
+uw_corpus <- corpus(tweets)
+toks <- tokens(uw_corpus, 
+               remove_punct = TRUE, remove_url = TRUE, remove_numbers = TRUE, verbose = TRUE)
+dataset_dict <- dfm(toks, dictionary = dictionary)
+dataset_dict_df <- quanteda::convert(dataset_dict, to='data.frame')
+uw = cbind(dataset_dict_df, tweets)
+uw$doc_id <- NULL
+
+uw$has_media <- is.na(uw$media_type) == FALSE
+uw$has_URL <- is.na(uw$urls_url) == FALSE
+
+#Log Transform
+uw$retweet_count_log <- log(uw$retweet_count + 1)
+
+#Model  
+lm <- glm(retweet_count_log ~ has_media + has_URL + followers_count + is_retweet, data = uw)
+lmsumm <- summ(lm, exp = TRUE, confint = TRUE, center = TRUE)
+lmsumm
+plot <- dwplot(lm, conf.level = .95, dot_args = list(size = 1.2),
+               whisker_args = list(size = 1)) 
+plot
+```
+
+# Historical Data
+
+We can search data from a particular time window with an academic API. You can specify the directory by using either "data_path" or "file". If you are using "data_path" to specify the place where you want to store your JSON format data, you should use "bind_tweets" function to reframe it to a data frame format. The package recommends users to use "data_path" instead of "file" in order to reduce the risk of data loss. "file" allows you to store data as an R data format. 
+
+```{r, include = FALSE}
+
+get_all_tweets(
+  query = c("tesed positive", "got covid", "have symptoms"), #search tweets that include these words
+  country = c("US"),
+  start_tweets = "2022-03-01T00:00:00Z",
+  end_tweets = "2022-04-17T00:00:00Z",
+  bearer_token = get_bearer(),
+  data_path = "data/tutorial",
+  n=5000)
+
+```
+
+```{r plotting}
+covid_tweets<- bind_tweets(data_path = "data/tutorial", output_format = "tidy")
+
+covid_tweets %>% 
+  ts_plot(by = "days") + 
+  geom_point() + 
+  labs(title = "Frequency of covid tweets by days", x = NULL)+
+  theme_bw(base_size = 14)
+
+```
+
